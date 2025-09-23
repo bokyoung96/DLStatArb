@@ -1,3 +1,6 @@
+# ARTICLE
+ARTICLE
+
 # Ignore DS_Store
 .DS_Store
 ._.DS_Store
@@ -6,6 +9,7 @@
 
 # DATA
 DATA
+PROCESSED
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

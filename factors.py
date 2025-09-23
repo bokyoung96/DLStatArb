@@ -1,9 +1,9 @@
 import logging
 import numpy as np
 import pandas as pd
-from sklearn.decomposition import PCA
-from sklearn.linear_model import LinearRegression
 from tqdm import tqdm
+from pathlib import Path
+from sklearn.decomposition import PCA
 
 from loader import DataLoader
 
@@ -26,8 +26,7 @@ class FactorModel:
     def _prepare_window(self, returns: pd.DataFrame, length: int) -> pd.DataFrame:
         return returns.tail(length).dropna(axis=1, how="any")
 
-    def fit_pca(self, returns: pd.DataFrame) -> None:
-        window = self._prepare_window(returns, self.win_pca)
+    def fit_pca(self, window: pd.DataFrame) -> None:
         pca = PCA(n_components=self.n_components)
         pca.fit(window)
 
@@ -38,47 +37,67 @@ class FactorModel:
         )
         self.explained_ratio_ = pca.explained_variance_ratio_
 
-    def fit_betas(self, returns: pd.DataFrame) -> None:
-        window = self._prepare_window(returns, self.win_beta)
-        self.stocks = window.columns.intersection(self.vectors.index)
+    def fit_betas(self, window: pd.DataFrame, common: pd.Index) -> None:
+        R = window[common].to_numpy()
+        V = self.vectors.loc[common].to_numpy()
+        F = R @ V
 
-        F = window[self.stocks].to_numpy() @ self.vectors.loc[self.stocks].to_numpy()
-        betas = {}
-        for stock in self.stocks:
-            y = window[stock].to_numpy()
-            X = F
-            model = LinearRegression().fit(X, y)
-            betas[stock] = model.coef_
+        # NOTE: OLS: Beta^T = (F^T F)^{-1} F^T R
+        G = F.T @ F
+        RHS = F.T @ R
+        Beta_T = np.linalg.solve(G, RHS)
+        Beta = Beta_T.T
 
-        self.betas = pd.DataFrame(betas, index=self.vectors.columns).T.loc[self.stocks]
+        self.betas = pd.DataFrame(Beta, index=common, columns=self.vectors.columns)
 
-    def residuals_at(self, today: pd.DataFrame) -> pd.Series:
-        common = today.columns.intersection(self.stocks)
-        Ft = today[common].to_numpy() @ self.vectors.loc[common].to_numpy()
-        fitted = (self.betas.loc[common].to_numpy() @ Ft.T).ravel()
-        resid = today[common].to_numpy().ravel() - fitted
+    def residuals_at(self, today: pd.DataFrame, common: pd.Index) -> pd.Series:
+        r_t = today[common].to_numpy().ravel()
+        f_t = (today[common].to_numpy() @ self.vectors.loc[common].to_numpy()).ravel()
+        fitted = (self.betas.loc[common].to_numpy() @ f_t)
+        resid = r_t - fitted
         return pd.Series(resid, index=common, name=today.index[0])
 
     def fit_all(self, returns: pd.DataFrame) -> None:
+        returns = returns.dropna(how='all')
+
         residuals_all = []
         explained = []
 
-        start = self.win_pca + self.win_beta
+        start = max(self.win_pca, self.win_beta)
         for t in tqdm(range(start, len(returns)), desc="Fitting windows"):
-            window = returns.iloc[:t]
-            today = returns.iloc[[t]]
+            win_pca = returns.iloc[t - self.win_pca:t].dropna(axis=1, how="any")
+            win_beta = returns.iloc[t - self.win_beta:t].dropna(axis=1, how="any")
+            today = returns.iloc[[t]].dropna(axis=1, how="any")
 
-            self.fit_pca(window)
-            self.fit_betas(window)
-            resid = self.residuals_at(today)
+            self.fit_pca(win_pca)
 
+            common = win_pca.columns.intersection(win_beta.columns).intersection(today.columns)
+
+            if len(common) <= self.n_components:
+                continue
+
+            self.fit_betas(win_beta, common)
+            resid = self.residuals_at(today, common)
             residuals_all.append(resid)
-            explained.append((today.index[0], float(np.sum(self.explained_ratio_))))
+
+            cum_var = float(np.sum(self.explained_ratio_))
+            explained.append((today.index[0], cum_var))
 
         self._residuals = pd.DataFrame(residuals_all)
-        self._explained_variances = pd.DataFrame(
-            explained, columns=["date", "cumulative_explained_variance"]
-        ).set_index("date")
+        self._explained_variances = (
+            pd.DataFrame(explained, columns=["date", "cumulative_explained_variance"])
+            .set_index("date")
+        )
+
+    def save(self, path: str | Path = 'DATA') -> None:
+        if self._residuals is None or self._explained_variances is None:
+            raise ValueError("Run fit_all first before saving.")
+
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+
+        self._residuals.to_parquet(path / "residuals.parquet")
+        self._explained_variances.to_parquet(path / "explained_variances.parquet")
 
     @property
     def residuals(self) -> pd.DataFrame:
@@ -95,4 +114,4 @@ if __name__ == "__main__":
     rets = close.pct_change(fill_method=None)
 
     model = FactorModel(n_components=5)
-    model.fit_all(rets)
+    model.fit_all(returns=rets)
