@@ -46,8 +46,8 @@ class CNNConfig:
     channels: Sequence[int] = (16, 32, 64, 128)
     kernel_sizes: Sequence[int] | None = None
     dilations: Sequence[int] | int = 1
-    dropout: float = 0.15
-    activation: str = "silu"
+    dropout: float = 0.0
+    activation: str = "relu"
     normalization: str = "instance"
     residual_scaling: float = 0.5
     multiscale_pool: bool = True
@@ -65,13 +65,13 @@ class CNNConfig:
             raise ValueError("residual_scaling must be positive.")
 
         if self.kernel_sizes is None:
-            self.kernel_sizes = tuple(3 for _ in self.channels)
+            self.kernel_sizes = tuple(2 for _ in self.channels)
         else:
             ks = tuple(int(k) for k in self.kernel_sizes)
             if len(ks) != len(self.channels):
                 raise ValueError("kernel_sizes length must match channels length.")
-            if any(k <= 0 or k % 2 == 0 for k in ks):
-                raise ValueError("kernel_sizes must be positive odd integers.")
+            if any(k <= 0 for k in ks):
+                raise ValueError("kernel_sizes must be positive integers.")
             self.kernel_sizes = ks
 
         if isinstance(self.dilations, Iterable) and not isinstance(self.dilations, (str, bytes)):
