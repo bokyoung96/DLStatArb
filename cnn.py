@@ -6,7 +6,11 @@ from typing import Iterable, Sequence
 import torch
 from torch import nn
 
-__all__ = ["CNNConfig", "ResidualConvBlock", "MultiScalePool", "ConvBackbone"]
+__all__ = [
+    "CNNConfig",
+    "ResidualConvBlock",
+    "ConvBackbone",
+]
 
 
 _ACTIVATIONS = {
@@ -43,15 +47,13 @@ def _build_norm(norm: str, channels: int) -> nn.Module:
 @dataclass
 class CNNConfig:
     in_channels: int = 1
-    channels: Sequence[int] = (16, 32, 64, 128)
+    channels: Sequence[int] = (8,)
     kernel_sizes: Sequence[int] | None = None
     dilations: Sequence[int] | int = 1
     dropout: float = 0.0
     activation: str = "relu"
     normalization: str = "instance"
-    residual_scaling: float = 0.5
-    multiscale_pool: bool = True
-    out_dim: int | None = None
+    residual_scaling: float = 1.0
     causal_padding: bool = True
 
     def __post_init__(self) -> None:
@@ -88,9 +90,7 @@ class CNNConfig:
             self.dilations = tuple(d for _ in self.channels)
 
     def effective_out_dim(self) -> int:
-        base = self.channels[-1]
-        pooled = base * 3 if self.multiscale_pool else base
-        return self.out_dim if self.out_dim is not None else pooled
+        return self.channels[-1]
 
 
 class ResidualConvBlock(nn.Module):
@@ -105,7 +105,7 @@ class ResidualConvBlock(nn.Module):
         activation: str = "relu",
         normalization: str = "instance",
         residual_scaling: float = 1.0,
-        causal_padding: bool = False,
+        causal_padding: bool = True,
     ) -> None:
         super().__init__()
 
@@ -142,14 +142,6 @@ class ResidualConvBlock(nn.Module):
         return residual + self.residual_scaling * out
 
 
-class MultiScalePool(nn.Module):
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        mean = x.mean(dim=-1)
-        max_val = x.max(dim=-1).values
-        std = torch.sqrt(torch.clamp(x.var(dim=-1, unbiased=False), min=1e-6))
-        return torch.cat([mean, max_val, std], dim=1)
-
-
 class ConvBackbone(nn.Module):
     def __init__(self, cfg: CNNConfig) -> None:
         super().__init__()
@@ -173,19 +165,7 @@ class ConvBackbone(nn.Module):
             )
             in_ch = out_ch
         self.blocks = nn.Sequential(*blocks)
-
-        self.pool: nn.Module = MultiScalePool() if cfg.multiscale_pool else nn.AdaptiveAvgPool1d(1)
-
-        output_dim = cfg.channels[-1] * (3 if cfg.multiscale_pool else 1)
-        if cfg.out_dim is None:
-            self.project = nn.Identity()
-            self._embed_dim = output_dim
-        else:
-            self.project = nn.Sequential(
-                nn.Linear(output_dim, cfg.out_dim),
-                _build_activation(cfg.activation),
-            )
-            self._embed_dim = cfg.out_dim
+        self._embed_dim = cfg.channels[-1]
 
     @property
     def embedding_dim(self) -> int:
@@ -194,17 +174,10 @@ class ConvBackbone(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim != 3:
             raise ValueError("Input tensor must have shape (B, C, L).")
-        features = self.blocks(x)
-        pooled = self.pool(features)
-        if pooled.ndim == 3:
-            pooled = pooled.squeeze(-1)
-        return self.project(pooled)
+        return self.blocks(x)
 
 
 if __name__ == "__main__":
     for causal in [False, True]:
         cfg = CNNConfig(channels=(32, 64), dropout=0.1, causal_padding=causal)
         model = ConvBackbone(cfg)
-        sample = torch.randn(8, 1, 64)
-        out = model(sample)
-        print(f"causal={causal}, output shape={out.shape}")

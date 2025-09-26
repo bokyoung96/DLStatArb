@@ -1,7 +1,5 @@
 ﻿from __future__ import annotations
 
-"""Training utilities for the DLStatArb CNN+Transformer model."""
-
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Optional
 
@@ -23,8 +21,6 @@ __all__ = [
 
 @dataclass
 class TrainerConfig:
-    """Hyperparameters that control the optimisation procedure."""
-
     epochs: int = 5
     lr: float = 1e-3
     weight_decay: float = 0.0
