@@ -1,19 +1,22 @@
 ﻿from __future__ import annotations
 
 import os
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Optional
 
 import torch
 from torch import nn
+from torch.amp import GradScaler as AmpGradScaler
+from torch.amp import autocast as amp_autocast
 from torch.utils.data import DataLoader
-
 from transformer import StatArbModel
-
 
 __all__ = [
     "TrainerConfig",
     "SharpeLoss",
+    "MeanVarianceLoss",
+    "SqrtMeanSharpeLoss",
     "TrainingLoop",
     "train_one_epoch",
     "evaluate",
@@ -26,12 +29,14 @@ class TrainerConfig:
     lr: float = 1e-3
     weight_decay: float = 0.0
     grad_clip: Optional[float] = 1.0
-    device: torch.device = field(default_factory=lambda: torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+    device: torch.device = field(default_factory=lambda: torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"))
     eval_interval: int = 1
     dtype: torch.dtype = torch.float32
-    # dlsa-public style options
-    objective: str = "sharpe"  # 'sharpe' | 'meanvar' | 'sqrtMeanSharpe'
-    weight_scheme: str = "softmax"  # 'softmax' (use model) | 'l1' (scores L1-normalized)
+    # NOTE: 'sharpe' | 'meanvar' | 'sqrtMeanSharpe'
+    objective: str = "sharpe"
+    # NOTE: 'softmax' (use model) | 'l1' (scores L1-normalized)
+    weight_scheme: str = "softmax"
     trans_cost: float = 0.0
     hold_cost: float = 0.0
     early_stopping: bool = False
@@ -43,26 +48,77 @@ class TrainerConfig:
 
 
 class SharpeLoss(nn.Module):
-    """Negative Sharpe ratio computed over a mini-batch of portfolio returns."""
-
     def __init__(self, *, epsilon: float = 1e-6) -> None:
         super().__init__()
         self.epsilon = epsilon
 
-    def forward(
-        self,
-        weights: torch.Tensor,
-        residual_next: torch.Tensor,
-        mask: torch.Tensor,
-    ) -> torch.Tensor:
-        if residual_next.ndim != 2:
-            raise ValueError("residual_next must have shape (batch, assets).")
-        masked_weights = torch.where(mask, weights, torch.zeros_like(weights))
-        pnl = (masked_weights * residual_next).sum(dim=-1)
-        mean = pnl.mean()
-        std = pnl.std(unbiased=False)
+    def forward(self, returns: torch.Tensor) -> torch.Tensor:
+        if returns.ndim != 1:
+            raise ValueError(
+                "returns must be a 1D tensor of per-sample pnl values.")
+        mean = returns.mean()
+        std = returns.std(unbiased=False)
         sharpe = mean / (std + self.epsilon)
         return -sharpe
+
+
+class MeanVarianceLoss(nn.Module):
+    def forward(self, returns: torch.Tensor) -> torch.Tensor:
+        if returns.ndim != 1:
+            raise ValueError(
+                "returns must be a 1D tensor of per-sample pnl values.")
+        mean = returns.mean()
+        std = returns.std(unbiased=False)
+        return -(mean * 252.0) + std * 15.9
+
+
+class SqrtMeanSharpeLoss(nn.Module):
+    def __init__(self, *, epsilon: float = 1e-6) -> None:
+        super().__init__()
+        self.epsilon = epsilon
+
+    def forward(self, returns: torch.Tensor) -> torch.Tensor:
+        if returns.ndim != 1:
+            raise ValueError(
+                "returns must be a 1D tensor of per-sample pnl values.")
+        mean = returns.mean()
+        std = returns.std(unbiased=False)
+        return -torch.sign(mean) * torch.sqrt(torch.abs(mean)) / (std + self.epsilon)
+
+
+def _resolve_loss(config: TrainerConfig, loss_fn: Optional[nn.Module]) -> nn.Module:
+    if loss_fn is not None:
+        return loss_fn
+    objective = (config.objective or "sharpe").lower()
+    if objective == "sharpe":
+        return SharpeLoss()
+    if objective == "meanvar":
+        return MeanVarianceLoss()
+    if objective == "sqrtmeansharpe":
+        return SqrtMeanSharpeLoss()
+    raise ValueError(
+        "Unsupported objective. Use 'sharpe', 'meanvar', or 'sqrtMeanSharpe', "
+        "or provide a custom loss_fn."
+    )
+
+
+def _should_use_amp(device: torch.device, dtype: torch.dtype) -> bool:
+    return device.type == "cuda" and dtype in (torch.float16, torch.bfloat16)
+
+
+def _make_grad_scaler(device: torch.device, use_amp: bool) -> Optional["AmpGradScaler"]:
+    if not use_amp:
+        return None
+    return AmpGradScaler(device_type=device.type)
+
+
+def _autocast_context(device: torch.device, use_amp: bool, dtype: torch.dtype):
+    if not use_amp:
+        return nullcontext()
+    kwargs: dict[str, object] = {"device_type": device.type}
+    if dtype in (torch.float16, torch.bfloat16):
+        kwargs["dtype"] = dtype
+    return amp_autocast(**kwargs)
 
 
 def _renorm_weights(
@@ -73,11 +129,6 @@ def _renorm_weights(
     scheme: str,
     eps: float = 1e-8,
 ) -> torch.Tensor:
-    """Return effective weights according to the chosen scheme.
-
-    - 'softmax': use model-provided weights (already masked/normalized in model)
-    - 'l1': L1-normalize scores per row, allowing long/short; invalid assets get 0.
-    """
     if scheme.lower() == "softmax":
         return torch.where(mask, model_weights, torch.zeros_like(model_weights))
 
@@ -98,10 +149,6 @@ def _apply_costs(
     trans_cost: float,
     hold_cost: float,
 ) -> torch.Tensor:
-    """Apply transaction/holding costs per batch along the time dimension.
-
-    Assumes the batch is ordered chronologically (shuffle=False).
-    """
     if trans_cost == 0.0 and hold_cost == 0.0:
         return returns
     b, n = weights.shape
@@ -109,8 +156,10 @@ def _apply_costs(
         turn = torch.zeros(b, device=weights.device, dtype=weights.dtype)
     else:
         turn = torch.sum((weights[1:] - weights[:-1]).abs(), dim=1)
-        turn = torch.cat([torch.zeros(1, device=weights.device, dtype=weights.dtype), turn], dim=0)
-    short_prop = torch.sum(torch.abs(torch.minimum(weights, torch.zeros(1, device=weights.device, dtype=weights.dtype))), dim=1)
+        turn = torch.cat(
+            [torch.zeros(1, device=weights.device, dtype=weights.dtype), turn], dim=0)
+    short_prop = torch.sum(torch.abs(torch.minimum(weights, torch.zeros(
+        1, device=weights.device, dtype=weights.dtype))), dim=1)
     return returns - trans_cost * turn - hold_cost * short_prop
 
 
@@ -122,23 +171,26 @@ def train_one_epoch(
     *,
     device: torch.device,
     grad_clip: Optional[float] = None,
-    scaler: Optional[torch.cuda.amp.GradScaler] = None,
+    scaler: Optional["AmpGradScaler"] = None,
+    use_amp: bool = False,
     config: Optional[TrainerConfig] = None,
 ) -> float:
     model.train()
     total_loss = 0.0
     num_batches = 0
+    amp_dtype = config.dtype if config else torch.float32
 
     for batch in loader:
         if len(batch) != 3:
-            raise ValueError("Data loader must yield (panel, mask, next_residual).")
+            raise ValueError(
+                "Data loader must yield (panel, mask, next_residual).")
         panel, mask, next_residual = batch
         panel = panel.to(device=device)
         mask = mask.to(device=device)
         next_residual = next_residual.to(device=device)
 
         optimizer.zero_grad(set_to_none=True)
-        with torch.cuda.amp.autocast(enabled=scaler is not None):
+        with _autocast_context(device, use_amp, amp_dtype):
             weights_soft, scores = model(panel, mask)
             eff_weights = _renorm_weights(
                 weights_soft, scores, mask,
@@ -150,17 +202,7 @@ def train_one_epoch(
                 trans_cost=(config.trans_cost if config else 0.0),
                 hold_cost=(config.hold_cost if config else 0.0),
             )
-            mean = pnl.mean()
-            std = pnl.std(unbiased=False)
-            obj = (config.objective if config else "sharpe").lower()
-            if obj == "sharpe":
-                loss = -(mean / (std + 1e-6))
-            elif obj == "meanvar":
-                loss = -(mean * 252.0) + std * 15.9
-            elif obj == "sqrtmeansharpe":
-                loss = -torch.sign(mean) * torch.sqrt(torch.abs(mean)) / (std + 1e-6)
-            else:
-                raise ValueError("Unsupported objective. Use 'sharpe', 'meanvar', or 'sqrtMeanSharpe'.")
+            loss = loss_fn(pnl)
 
         if scaler is None:
             loss.backward()
@@ -196,7 +238,8 @@ def evaluate(
 
     for batch in loader:
         if len(batch) != 3:
-            raise ValueError("Data loader must yield (panel, mask, next_residual).")
+            raise ValueError(
+                "Data loader must yield (panel, mask, next_residual).")
         panel, mask, next_residual = batch
         panel = panel.to(device=device)
         mask = mask.to(device=device)
@@ -213,17 +256,7 @@ def evaluate(
             trans_cost=(config.trans_cost if config else 0.0),
             hold_cost=(config.hold_cost if config else 0.0),
         )
-        mean = pnl.mean()
-        std = pnl.std(unbiased=False)
-        obj = (config.objective if config else "sharpe").lower()
-        if obj == "sharpe":
-            loss = -(mean / (std + 1e-6))
-        elif obj == "meanvar":
-            loss = -(mean * 252.0) + std * 15.9
-        elif obj == "sqrtmeansharpe":
-            loss = -torch.sign(mean) * torch.sqrt(torch.abs(mean)) / (std + 1e-6)
-        else:
-            raise ValueError("Unsupported objective. Use 'sharpe', 'meanvar', or 'sqrtMeanSharpe'.")
+        loss = loss_fn(pnl)
         losses.append(float(loss))
 
         returns.append(pnl.detach().cpu())
@@ -244,24 +277,24 @@ def TrainingLoop(
     val_loader: Optional[DataLoader] = None,
     *,
     config: TrainerConfig,
-    optimizer_factory: Optional[Callable[[Iterable[torch.nn.Parameter]], torch.optim.Optimizer]] = None,
+    optimizer_factory: Optional[Callable[[
+        Iterable[torch.nn.Parameter]], torch.optim.Optimizer]] = None,
     loss_fn: Optional[nn.Module] = None,
 ) -> list[dict[str, float]]:
-    """Run the optimisation loop and return epoch-wise metrics."""
-
     device = config.device
     model = model.to(device=device, dtype=config.dtype)
-    loss_fn = loss_fn or SharpeLoss()
+    loss_fn = _resolve_loss(config, loss_fn)
 
+    use_amp = _should_use_amp(device, config.dtype)
     if optimizer_factory is None:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     else:
         optimizer = optimizer_factory(model.parameters())
 
-    scaler = torch.cuda.amp.GradScaler() if device.type == "cuda" else None
+    scaler = _make_grad_scaler(device, use_amp)
 
     history: list[dict[str, float]] = []
-    # Optional resume
     if config.checkpoint_path and os.path.isfile(config.checkpoint_path) and not config.force_retrain:
         try:
             ckpt = torch.load(config.checkpoint_path, map_location=device)
@@ -283,12 +316,14 @@ def TrainingLoop(
             device=device,
             grad_clip=config.grad_clip,
             scaler=scaler,
+            use_amp=use_amp,
             config=config,
         )
 
         metrics = {"epoch": epoch, "train_loss": train_loss}
         if val_loader is not None and epoch % config.eval_interval == 0:
-            val_metrics = evaluate(model, val_loader, loss_fn, device=device, config=config)
+            val_metrics = evaluate(
+                model, val_loader, loss_fn, device=device, config=config)
             metrics.update({f"val_{k}": v for k, v in val_metrics.items()})
 
             if config.early_stopping:
@@ -306,13 +341,14 @@ def TrainingLoop(
                 else:
                     patience += 1
                     if patience >= config.early_stopping_patience:
-                        # decay lr and optionally restore best state
                         for pg in optimizer.param_groups:
                             pg["lr"] *= config.lr_decay
                         if config.checkpoint_path and os.path.isfile(config.checkpoint_path):
                             try:
-                                ckpt = torch.load(config.checkpoint_path, map_location=device)
-                                model.load_state_dict(ckpt.get("model_state_dict", {}))
+                                ckpt = torch.load(
+                                    config.checkpoint_path, map_location=device)
+                                model.load_state_dict(
+                                    ckpt.get("model_state_dict", {}))
                             except Exception:
                                 pass
                         patience = 0
@@ -323,5 +359,4 @@ def TrainingLoop(
                             break
 
         history.append(metrics)
-
     return history

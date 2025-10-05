@@ -4,9 +4,8 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
-from torch import nn
-
 from cnn import CNNConfig, ConvBackbone, _build_activation
+from torch import nn
 
 __all__ = [
     "TransformerConfig",
@@ -70,7 +69,8 @@ class StatArbModel(nn.Module):
             batch_first=cfg.transformer.batch_first,
             activation=_build_activation(cfg.transformer.activation),
         )
-        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=cfg.transformer.num_layers)
+        self.encoder = nn.TransformerEncoder(
+            enc_layer, num_layers=cfg.transformer.num_layers)
 
         # NOTE: Linear head to map last time step features to scores per asset
         self.linear = nn.Linear(d_model, 1)
@@ -81,7 +81,8 @@ class StatArbModel(nn.Module):
         mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if panel.ndim != 3:
-            raise ValueError("panel must have shape (batch, assets, lookback).")
+            raise ValueError(
+                "panel must have shape (batch, assets, lookback).")
         B, N, L = panel.shape
         if L <= 0:
             raise ValueError("lookback dimension must be positive.")
@@ -111,7 +112,7 @@ class StatArbModel(nn.Module):
             feats = self.pre_transform(feats)
             encoded = self.encoder(feats)
             last = encoded[-1, :, :]
-        
+
         # NOTE: (B*N,)
         scores_flat = self.linear(last).squeeze(-1)
         scores = scores_flat.view(B, N)
@@ -133,8 +134,10 @@ class StatArbModel(nn.Module):
 
 if __name__ == "__main__":
     cfg = ModelConfig(
-        cnn=CNNConfig(channels=(8,), activation="relu", normalization="instance", causal_padding=True),
-        transformer=TransformerConfig(d_model=8, nhead=4, num_layers=1, dim_feedforward=16, dropout=0.25),
+        cnn=CNNConfig(channels=(8,), activation="relu",
+                      normalization="instance", causal_padding=True),
+        transformer=TransformerConfig(
+            d_model=8, nhead=4, num_layers=1, dim_feedforward=16, dropout=0.25),
     )
     model = StatArbModel(cfg)
     panel = torch.randn(2, 10, 30)
