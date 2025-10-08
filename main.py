@@ -2,163 +2,24 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
-import numpy as np
 import torch
-from classify import WindowClassifier, WindowsSplit
 from cnn import CNNConfig
-from preprocess import ResidualsDataset, WindowBuilder, WindowConfig, Windows
-from torch.utils.data import DataLoader
+from datas import DataConfig, DataPipeline
 from training import (MeanVarianceLoss, SharpeLoss, SqrtMeanSharpeLoss,
-                      TrainerConfig, TrainingLoop, evaluate)
+                      TrainerConfig, TrainingLoop, evaluate, select_device)
 from transformer import ModelConfig, StatArbModel, TransformerConfig
 
 CONFIG_PATH = Path("train_config.json")
-
-
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class ScriptConfig:
-    windows_path: Path = Path("PROCESSED/residual_windows.pt")
-    residuals_path: Path = Path("DATA/residuals.parquet")
-    lookback: int = 30
-    stride: int = 1
-    min_assets: int = 25
-    min_valid_ratio: float = 1.0
-    horizon: int = 0
-    zero_as_invalid: bool = False
-    train_end: Optional[str] = None
-    val_end: Optional[str] = None
-    train_ratio: float = 0.8
-    val_ratio: float = 0.1
-    batch_size: int = 200
-    num_workers: int = 0
-    epochs: int = 100
-    lr: float = 1e-3
-    weight_decay: float = 0.0
-    grad_clip: float = 1.0
-    eval_interval: int = 1
-    objective: str = "sharpe"
-    weight_scheme: str = "l1"
-    trans_cost: float = 0.0005
-    hold_cost: float = 0.0001
-    early_stopping: bool = False
-    early_stopping_patience: int = 50
-    early_stopping_max_trials: int = 5
-    lr_decay: float = 0.5
-    checkpoint: Optional[Path] = None
-    force_retrain: bool = False
-    dtype: str = "float32"
-    device: Optional[str] = None
-    history_out: Optional[Path] = None
-    log_test: bool = False
-    cnn_in_channels: int = 1
-    cnn_channels: list[int] = None  # type: ignore[assignment]
-    cnn_kernel_sizes: list[int] = None  # type: ignore[assignment]
-    cnn_dilations: int | list[int] = 1
-    cnn_dropout: float = 0.1
-    cnn_activation: str = "relu"
-    cnn_normalization: str = "instance"
-    cnn_residual_scaling: float = 1.0
-    cnn_causal_padding: bool = True
-    transformer_d_model: int = 64
-    transformer_nhead: int = 4
-    transformer_num_layers: int = 2
-    transformer_dim_feedforward: Optional[int] = None
-    transformer_dropout: float = 0.1
-    transformer_batch_first: bool = False
-    transformer_activation: str = "relu"
-
-    def __post_init__(self) -> None:
-        if self.cnn_channels is None:
-            self.cnn_channels = [32, 64, 64]
-        if self.cnn_kernel_sizes is None:
-            self.cnn_kernel_sizes = [3, 3, 3]
-
-
-def load_config(path: Path = CONFIG_PATH) -> tuple[ScriptConfig, bool]:
-    cfg = ScriptConfig()
+def load_cfg(path: Path = CONFIG_PATH) -> dict:
     if not path.is_file():
-        return cfg, False
+        raise FileNotFoundError(f"Config file not found: {path}")
     with path.open("r", encoding="utf-8") as fp:
-        overrides = json.load(fp)
-    apply_overrides(cfg, overrides)
-    return cfg, True
-
-
-def apply_overrides(cfg: ScriptConfig, overrides: dict) -> None:
-    for key, value in overrides.items():
-        if not hasattr(cfg, key):
-            continue
-        if key in {"windows_path", "residuals_path", "checkpoint", "history_out"} and value is not None:
-            setattr(cfg, key, Path(value))
-        elif key in {"cnn_channels", "cnn_kernel_sizes"} and value is not None:
-            setattr(cfg, key, [int(v) for v in value])
-        else:
-            setattr(cfg, key, value)
-
-
-def load_or_build_windows(cfg: ScriptConfig) -> Windows:
-    if cfg.windows_path.is_file():
-        return WindowBuilder.load_windows(cfg.windows_path)
-
-    builder = WindowBuilder(
-        WindowConfig(
-            residuals_path=cfg.residuals_path,
-            output_path=cfg.windows_path,
-            lookback=cfg.lookback,
-            stride=cfg.stride,
-            min_assets=cfg.min_assets,
-            min_valid_ratio=cfg.min_valid_ratio,
-            zero_as_invalid=cfg.zero_as_invalid,
-            horizon=cfg.horizon,
-        )
-    )
-    return builder.build()
-
-
-def split_windows(windows: Windows, cfg: ScriptConfig) -> WindowsSplit:
-    if cfg.train_end and windows.dates is not None and windows.dates.size > 0:
-        classifier = WindowClassifier(windows)
-        return classifier.by_date(train_end=cfg.train_end, val_end=cfg.val_end)
-
-    total = windows.data.shape[0]
-    if total < 3:
-        raise ValueError(
-            "Not enough windows to split into train/val/test segments.")
-
-    train_end = max(1, int(total * cfg.train_ratio))
-    val_candidate = int(total * (cfg.train_ratio + cfg.val_ratio))
-    val_end = max(train_end + 1, min(val_candidate, total - 1))
-
-    idx_all = np.arange(total)
-    train_idx = idx_all[:train_end]
-    val_idx = idx_all[train_end:val_end]
-    test_idx = idx_all[val_end:]
-
-    return WindowsSplit(
-        train=WindowClassifier._slice(windows, train_idx),
-        val=WindowClassifier._slice(windows, val_idx),
-        test=WindowClassifier._slice(windows, test_idx),
-    )
-
-
-def make_loader(windows: Windows, batch_size: int, num_workers: int, device: torch.device) -> Optional[DataLoader]:
-    dataset = ResidualsDataset(windows)
-    if len(dataset) == 0:
-        return None
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=(device.type == "cuda"),
-    )
+        return json.load(fp)
 
 
 def parse_dtype(name: str) -> torch.dtype:
@@ -170,87 +31,111 @@ def parse_dtype(name: str) -> torch.dtype:
     return mapping[name]
 
 
-def build_model(cfg: ScriptConfig) -> StatArbModel:
-    dilations = tuple(cfg.cnn_dilations) if isinstance(
-        cfg.cnn_dilations, (list, tuple)) else cfg.cnn_dilations
+def build_model(cfg: dict) -> StatArbModel:
+    dilations = cfg.get("cnn_dilations", 1)
+    dilations = tuple(dilations) if isinstance(
+        dilations, (list, tuple)) else int(dilations)
     cnn_cfg = CNNConfig(
-        in_channels=cfg.cnn_in_channels,
-        channels=tuple(cfg.cnn_channels),
-        kernel_sizes=tuple(cfg.cnn_kernel_sizes),
+        in_channels=int(cfg.get("cnn_in_channels", 1)),
+        channels=tuple(cfg.get("cnn_channels", [32, 64, 64])),
+        kernel_sizes=tuple(cfg.get("cnn_kernel_sizes", [3, 3, 3])),
         dilations=dilations,
-        dropout=cfg.cnn_dropout,
-        activation=cfg.cnn_activation,
-        normalization=cfg.cnn_normalization,
-        residual_scaling=cfg.cnn_residual_scaling,
-        causal_padding=cfg.cnn_causal_padding,
+        dropout=float(cfg.get("cnn_dropout", 0.1)),
+        activation=str(cfg.get("cnn_activation", "relu")),
+        normalization=str(cfg.get("cnn_normalization", "instance")),
+        residual_scaling=float(cfg.get("cnn_residual_scaling", 1.0)),
+        causal_padding=bool(cfg.get("cnn_causal_padding", True)),
     )
+    d_model = int(cfg.get("transformer_d_model", 64))
     transformer_cfg = TransformerConfig(
-        d_model=cfg.transformer_d_model,
-        nhead=cfg.transformer_nhead,
-        num_layers=cfg.transformer_num_layers,
-        dim_feedforward=cfg.transformer_dim_feedforward or 0,
-        dropout=cfg.transformer_dropout,
-        batch_first=cfg.transformer_batch_first,
-        activation=cfg.transformer_activation,
+        d_model=d_model,
+        nhead=int(cfg.get("transformer_nhead", 4)),
+        num_layers=int(cfg.get("transformer_num_layers", 2)),
+        dim_feedforward=int(cfg.get("transformer_dim_feedforward", d_model)),
+        dropout=float(cfg.get("transformer_dropout", 0.1)),
+        batch_first=bool(cfg.get("transformer_batch_first", True)),
+        activation=str(cfg.get("transformer_activation", "relu")),
     )
     return StatArbModel(ModelConfig(cnn=cnn_cfg, transformer=transformer_cfg))
 
 
-def build_loss(cfg: ScriptConfig) -> torch.nn.Module:
-    objective = cfg.objective.lower()
+def build_loss(cfg: dict) -> torch.nn.Module:
+    objective = str(cfg.get("objective", "sharpe")).lower()
     if objective == "sharpe":
         return SharpeLoss()
     if objective == "meanvar":
         return MeanVarianceLoss()
     if objective == "sqrtmeansharpe":
         return SqrtMeanSharpeLoss()
-    raise ValueError(f"Unsupported objective: {cfg.objective}")
+    raise ValueError(f"Unsupported objective: {cfg.get('objective')}")
 
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO,
                         format="[%(levelname)s] %(message)s")
-    cfg, loaded_from_file = load_config()
-    if loaded_from_file:
-        logger.info("Loaded config overrides from %s", CONFIG_PATH)
-    else:
-        logger.info("Using default configuration (no %s found)", CONFIG_PATH)
+    cfg = load_cfg(CONFIG_PATH)
+    logger.info("Loaded config: %s", CONFIG_PATH)
 
-    windows = load_or_build_windows(cfg)
-    split = split_windows(windows, cfg)
+    data_cfg = DataConfig(
+        windows_path=Path(
+            cfg.get("windows_path", "PROCESSED/residual_windows.pt")),
+        residuals_path=Path(
+            cfg.get("residuals_path", "DATA/residuals.parquet")),
+        lookback=int(cfg.get("lookback", 30)),
+        stride=int(cfg.get("stride", 1)),
+        min_assets=int(cfg.get("min_assets", 25)),
+        min_valid_ratio=float(cfg.get("min_valid_ratio", 1.0)),
+        zero_as_invalid=bool(cfg.get("zero_as_invalid", False)),
+        factor_n_components=int(cfg.get("factor_n_components", 5)),
+        factor_win_pca=int(cfg.get("factor_win_pca", 252)),
+        factor_win_beta=int(cfg.get("factor_win_beta", 60)),
+        data_dir=(Path(cfg["data_dir"]) if cfg.get("data_dir") else None),
+        horizon=int(cfg.get("horizon", 0)),
+        train_end=cfg.get("train_end"),
+        val_end=cfg.get("val_end"),
+        train_ratio=float(cfg.get("train_ratio", 0.8)),
+        val_ratio=float(cfg.get("val_ratio", 0.1)),
+    )
 
-    device = torch.device(cfg.device) if cfg.device else torch.device(
-        "cuda" if torch.cuda.is_available() else "cpu")
+    pipeline = DataPipeline(data_cfg)
+    device = select_device(cfg.get("device"))
+    artifacts = pipeline.run(batch_size=int(cfg.get("batch_size", 200)),
+                             num_workers=int(cfg.get("num_workers", 2)), device=device)
+    train_loader = artifacts.train_loader
+    val_loader = artifacts.val_loader
+    test_loader = artifacts.test_loader
 
-    train_loader = make_loader(
-        split.train, cfg.batch_size, cfg.num_workers, device)
-    val_loader = make_loader(split.val, cfg.batch_size,
-                             cfg.num_workers, device) if split.val.data.size else None
-    test_loader = make_loader(split.test, cfg.batch_size,
-                              cfg.num_workers, device) if split.test.data.size else None
+    logger.info("Device=%s, dtype=%s, loaders: train=%s, val=%s, test=%s",
+                device, parse_dtype(cfg.get("dtype", "float32")),
+                0 if train_loader is None else len(train_loader),
+                0 if val_loader is None else len(val_loader),
+                0 if test_loader is None else len(test_loader))
 
     if train_loader is None:
         raise RuntimeError(
             "No training windows available. Check preprocessing configuration.")
 
     trainer_cfg = TrainerConfig(
-        epochs=cfg.epochs,
-        lr=cfg.lr,
-        weight_decay=cfg.weight_decay,
-        grad_clip=cfg.grad_clip,
+        epochs=int(cfg.get("epochs", 100)),
+        lr=float(cfg.get("lr", 1e-3)),
+        weight_decay=float(cfg.get("weight_decay", 0.0)),
+        grad_clip=float(cfg.get("grad_clip", 1.0)),
         device=device,
-        eval_interval=cfg.eval_interval,
-        dtype=parse_dtype(cfg.dtype),
-        objective=cfg.objective,
-        weight_scheme=cfg.weight_scheme,
-        trans_cost=cfg.trans_cost,
-        hold_cost=cfg.hold_cost,
-        early_stopping=cfg.early_stopping,
-        early_stopping_patience=cfg.early_stopping_patience,
-        early_stopping_max_trials=cfg.early_stopping_max_trials,
-        lr_decay=cfg.lr_decay,
-        checkpoint_path=str(cfg.checkpoint) if cfg.checkpoint else None,
-        force_retrain=cfg.force_retrain,
+        eval_interval=int(cfg.get("eval_interval", 1)),
+        dtype=parse_dtype(cfg.get("dtype", "float32")),
+        objective=str(cfg.get("objective", "sharpe")),
+        weight_scheme=str(cfg.get("weight_scheme", "l1")),
+        hold_cost=float(cfg.get("hold_cost", 0.0001)),
+        early_stopping=bool(cfg.get("early_stopping", False)),
+        early_stopping_patience=int(cfg.get("early_stopping_patience", 50)),
+        early_stopping_max_trials=int(cfg.get("early_stopping_max_trials", 5)),
+        lr_decay=float(cfg.get("lr_decay", 0.5)),
+        checkpoint_path=(str(cfg.get("checkpoint"))
+                         if cfg.get("checkpoint") else None),
+        force_retrain=bool(cfg.get("force_retrain", False)),
+        micro_batch_size=(int(cfg.get("micro_batch_size")) if cfg.get(
+            "micro_batch_size") is not None else None),
+        accumulate_steps=int(cfg.get("accumulate_steps", 1)),
     )
 
     model = build_model(cfg)
@@ -269,16 +154,36 @@ def main() -> None:
     else:
         logger.info("Training completed with empty history.")
 
-    if cfg.history_out is not None:
-        cfg.history_out.parent.mkdir(parents=True, exist_ok=True)
-        with cfg.history_out.open("w", encoding="utf-8") as fp:
+    if cfg.get("history_out"):
+        hpath = Path(cfg["history_out"])
+        hpath.parent.mkdir(parents=True, exist_ok=True)
+        with hpath.open("w", encoding="utf-8") as fp:
             json.dump(history, fp, indent=2)
-        logger.info("Saved history to %s", cfg.history_out)
+        logger.info("Saved history to %s", hpath)
 
-    if cfg.log_test and test_loader is not None:
-        test_metrics = evaluate(model, test_loader, build_loss(
-            cfg), device=trainer_cfg.device, config=trainer_cfg)
+    if cfg.get("model_out"):
+        mpath = Path(cfg["model_out"])
+        mpath.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(model.state_dict(), mpath)
+        logger.info("Saved final model state_dict to %s", mpath)
+
+    if cfg.get("config_out"):
+        cpath = Path(cfg["config_out"])
+        cpath.parent.mkdir(parents=True, exist_ok=True)
+        with cpath.open("w", encoding="utf-8") as fp:
+            json.dump(cfg, fp, indent=2)
+        logger.info("Saved resolved config to %s", cpath)
+
+    if cfg.get("log_test", False) and test_loader is not None:
+        test_metrics = evaluate(model, test_loader, loss_module,
+                                device=trainer_cfg.device, config=trainer_cfg)
         logger.info("Test metrics: %s", test_metrics)
+        if cfg.get("test_out"):
+            tpath = Path(cfg["test_out"])
+            tpath.parent.mkdir(parents=True, exist_ok=True)
+            with tpath.open("w", encoding="utf-8") as fp:
+                json.dump(test_metrics, fp, indent=2)
+            logger.info("Saved test metrics to %s", tpath)
 
 
 if __name__ == "__main__":

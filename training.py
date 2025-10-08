@@ -10,10 +10,12 @@ from torch import nn
 from torch.amp import GradScaler as AmpGradScaler
 from torch.amp import autocast as amp_autocast
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 from transformer import StatArbModel
 
 __all__ = [
     "TrainerConfig",
+    "select_device",
     "SharpeLoss",
     "MeanVarianceLoss",
     "SqrtMeanSharpeLoss",
@@ -23,28 +25,41 @@ __all__ = [
 ]
 
 
+def select_device(preferred: Optional[str] = None) -> torch.device:
+    if preferred:
+        return torch.device(preferred)
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
 @dataclass
 class TrainerConfig:
     epochs: int = 5
     lr: float = 1e-3
     weight_decay: float = 0.0
     grad_clip: Optional[float] = 1.0
-    device: torch.device = field(default_factory=lambda: torch.device(
-        "cuda" if torch.cuda.is_available() else "cpu"))
+    device: torch.device = field(default_factory=select_device)
     eval_interval: int = 1
     dtype: torch.dtype = torch.float32
-    # NOTE: 'sharpe' | 'meanvar' | 'sqrtMeanSharpe'
     objective: str = "sharpe"
-    # NOTE: 'softmax' (use model) | 'l1' (scores L1-normalized)
     weight_scheme: str = "softmax"
-    trans_cost: float = 0.0
     hold_cost: float = 0.0
+    buy_cost: float = 0.0002
+    sell_cost: float = 0.0002
+    sell_tax: float = 0.0015
+    slippage: float = 0.0001
     early_stopping: bool = False
     early_stopping_patience: int = 50
     early_stopping_max_trials: int = 5
     lr_decay: float = 0.5
     checkpoint_path: Optional[str] = None
     force_retrain: bool = True
+    show_progress: bool = True
+    micro_batch_size: Optional[int] = None
+    accumulate_steps: int = 1
 
 
 class SharpeLoss(nn.Module):
@@ -89,7 +104,7 @@ class SqrtMeanSharpeLoss(nn.Module):
 def _resolve_loss(config: TrainerConfig, loss_fn: Optional[nn.Module]) -> nn.Module:
     if loss_fn is not None:
         return loss_fn
-    objective = (config.objective or "sharpe").lower()
+    objective = config.objective.lower()
     if objective == "sharpe":
         return SharpeLoss()
     if objective == "meanvar":
@@ -121,6 +136,15 @@ def _autocast_context(device: torch.device, use_amp: bool, dtype: torch.dtype):
     return amp_autocast(**kwargs)
 
 
+def _progress_iter(loader: Iterable, enable: bool, desc: str):
+    if not enable:
+        for item in loader:
+            yield item
+        return
+    for item in tqdm(loader, desc=desc, leave=False):
+        yield item
+
+
 def _renorm_weights(
     model_weights: torch.Tensor,
     scores: torch.Tensor,
@@ -146,21 +170,37 @@ def _apply_costs(
     returns: torch.Tensor,
     weights: torch.Tensor,
     *,
-    trans_cost: float,
     hold_cost: float,
+    buy_cost: float,
+    sell_cost: float,
+    sell_tax: float,
+    slippage: float,
 ) -> torch.Tensor:
-    if trans_cost == 0.0 and hold_cost == 0.0:
-        return returns
-    b, n = weights.shape
+    b, _ = weights.shape
     if b <= 1:
-        turn = torch.zeros(b, device=weights.device, dtype=weights.dtype)
+        buys = torch.zeros(b, device=weights.device, dtype=weights.dtype)
+        sells = torch.zeros(b, device=weights.device, dtype=weights.dtype)
     else:
-        turn = torch.sum((weights[1:] - weights[:-1]).abs(), dim=1)
-        turn = torch.cat(
-            [torch.zeros(1, device=weights.device, dtype=weights.dtype), turn], dim=0)
-    short_prop = torch.sum(torch.abs(torch.minimum(weights, torch.zeros(
-        1, device=weights.device, dtype=weights.dtype))), dim=1)
-    return returns - trans_cost * turn - hold_cost * short_prop
+        dW = weights[1:] - weights[:-1]
+        buy_amt = torch.relu(dW).sum(dim=1)
+        sell_amt = torch.relu(-dW).sum(dim=1)
+        buys = torch.cat([
+            torch.zeros(1, device=weights.device, dtype=weights.dtype),
+            buy_amt,
+        ], dim=0)
+        sells = torch.cat([
+            torch.zeros(1, device=weights.device, dtype=weights.dtype),
+            sell_amt,
+        ], dim=0)
+    buy_fee = (buy_cost + slippage) * buys
+    sell_fee = (sell_cost + sell_tax + slippage) * sells
+    short_prop = torch.sum(
+        torch.abs(torch.minimum(weights, torch.zeros(
+            1, device=weights.device, dtype=weights.dtype))),
+        dim=1,
+    )
+    hold_fee = hold_cost * short_prop
+    return returns - (buy_fee + sell_fee + hold_fee)
 
 
 def train_one_epoch(
@@ -173,14 +213,21 @@ def train_one_epoch(
     grad_clip: Optional[float] = None,
     scaler: Optional["AmpGradScaler"] = None,
     use_amp: bool = False,
-    config: Optional[TrainerConfig] = None,
+    config: TrainerConfig,
+    progress_desc: str = "Train",
 ) -> float:
     model.train()
     total_loss = 0.0
     num_batches = 0
-    amp_dtype = config.dtype if config else torch.float32
+    amp_dtype = config.dtype
 
-    for batch in loader:
+    iterator = _progress_iter(
+        loader,
+        enable=config.show_progress,
+        desc=progress_desc,
+    )
+
+    for batch in iterator:
         if len(batch) != 3:
             raise ValueError(
                 "Data loader must yield (panel, mask, next_residual).")
@@ -189,35 +236,63 @@ def train_one_epoch(
         mask = mask.to(device=device)
         next_residual = next_residual.to(device=device)
 
+        batch_size = panel.shape[0]
+        micro_bs = (config.micro_batch_size if (config.micro_batch_size and config.micro_batch_size > 0)
+                    else batch_size)
+        accum_steps = max(int(config.accumulate_steps), 1)
         optimizer.zero_grad(set_to_none=True)
-        with _autocast_context(device, use_amp, amp_dtype):
-            weights_soft, scores = model(panel, mask)
-            eff_weights = _renorm_weights(
-                weights_soft, scores, mask,
-                scheme=(config.weight_scheme if config else "softmax"),
-            )
-            pnl = (eff_weights * next_residual).sum(dim=-1)
-            pnl = _apply_costs(
-                pnl, eff_weights,
-                trans_cost=(config.trans_cost if config else 0.0),
-                hold_cost=(config.hold_cost if config else 0.0),
-            )
-            loss = loss_fn(pnl)
 
-        if scaler is None:
-            loss.backward()
-            if grad_clip is not None:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            optimizer.step()
-        else:
-            scaler.scale(loss).backward()
-            if grad_clip is not None:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
+        micro_count = 0
+        running_loss = 0.0
+        for start in range(0, batch_size, micro_bs):
+            end = min(start + micro_bs, batch_size)
+            p = panel[start:end]
+            m = mask[start:end]
+            r = next_residual[start:end]
 
-        total_loss += float(loss.detach())
+            with _autocast_context(device, use_amp, amp_dtype):
+                weights_soft, scores = model(p, m)
+                eff_weights = _renorm_weights(
+                    weights_soft, scores, m,
+                    scheme=config.weight_scheme,
+                )
+                pnl = (eff_weights * r).sum(dim=-1)
+                pnl = _apply_costs(
+                    pnl, eff_weights,
+                    hold_cost=config.hold_cost,
+                    buy_cost=config.buy_cost,
+                    sell_cost=config.sell_cost,
+                    sell_tax=config.sell_tax,
+                    slippage=config.slippage,
+                )
+                loss = loss_fn(pnl)
+
+            scaled_loss = loss / float(accum_steps)
+            if scaler is None:
+                scaled_loss.backward()
+            else:
+                scaler.scale(scaled_loss).backward()
+
+            micro_count += 1
+            running_loss += float(loss.detach()) * ((end - start) / batch_size)
+
+            if (micro_count % accum_steps == 0) or (end == batch_size):
+                if grad_clip is not None:
+                    if scaler is None:
+                        torch.nn.utils.clip_grad_norm_(
+                            model.parameters(), grad_clip)
+                    else:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(
+                            model.parameters(), grad_clip)
+                if scaler is None:
+                    optimizer.step()
+                else:
+                    scaler.step(optimizer)
+                    scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+
+        total_loss += running_loss
         num_batches += 1
 
     return total_loss / max(num_batches, 1)
@@ -230,13 +305,20 @@ def evaluate(
     loss_fn: nn.Module,
     *,
     device: torch.device,
-    config: Optional[TrainerConfig] = None,
+    config: TrainerConfig,
+    progress_desc: str = "Eval",
 ) -> dict[str, float]:
     model.eval()
     losses: list[float] = []
     returns: list[torch.Tensor] = []
 
-    for batch in loader:
+    iterator = _progress_iter(
+        loader,
+        enable=config.show_progress,
+        desc=progress_desc,
+    )
+
+    for batch in iterator:
         if len(batch) != 3:
             raise ValueError(
                 "Data loader must yield (panel, mask, next_residual).")
@@ -247,14 +329,15 @@ def evaluate(
 
         weights_soft, scores = model(panel, mask)
         eff_weights = _renorm_weights(
-            weights_soft, scores, mask,
-            scheme=(config.weight_scheme if config else "softmax"),
-        )
+            weights_soft, scores, mask, scheme=config.weight_scheme)
         pnl = (eff_weights * next_residual).sum(dim=-1)
         pnl = _apply_costs(
             pnl, eff_weights,
-            trans_cost=(config.trans_cost if config else 0.0),
-            hold_cost=(config.hold_cost if config else 0.0),
+            hold_cost=config.hold_cost,
+            buy_cost=config.buy_cost,
+            sell_cost=config.sell_cost,
+            sell_tax=config.sell_tax,
+            slippage=config.slippage,
         )
         loss = loss_fn(pnl)
         losses.append(float(loss))
@@ -306,8 +389,15 @@ def TrainingLoop(
     best_val = float("inf")
     patience = 0
     reductions = 0
+    saved_any_ckpt = False
 
-    for epoch in range(1, config.epochs + 1):
+    if config.show_progress:
+        epoch_iter: Iterable[int] = tqdm(
+            range(1, config.epochs + 1), desc="Epoch", leave=True)
+    else:
+        epoch_iter = range(1, config.epochs + 1)
+
+    for epoch in epoch_iter:
         train_loss = train_one_epoch(
             model,
             train_loader,
@@ -318,12 +408,19 @@ def TrainingLoop(
             scaler=scaler,
             use_amp=use_amp,
             config=config,
+            progress_desc=f"Train (epoch {epoch})",
         )
 
         metrics = {"epoch": epoch, "train_loss": train_loss}
         if val_loader is not None and epoch % config.eval_interval == 0:
             val_metrics = evaluate(
-                model, val_loader, loss_fn, device=device, config=config)
+                model,
+                val_loader,
+                loss_fn,
+                device=device,
+                config=config,
+                progress_desc=f"Eval (epoch {epoch})",
+            )
             metrics.update({f"val_{k}": v for k, v in val_metrics.items()})
 
             if config.early_stopping:
@@ -338,6 +435,7 @@ def TrainingLoop(
                             "epoch": epoch,
                             "val_loss": best_val,
                         }, config.checkpoint_path)
+                        saved_any_ckpt = True
                 else:
                     patience += 1
                     if patience >= config.early_stopping_patience:
@@ -359,4 +457,18 @@ def TrainingLoop(
                             break
 
         history.append(metrics)
+
+    # Always save a final checkpoint if a path is provided and no checkpoint
+    # was saved during training (e.g., early_stopping disabled or no improvement).
+    if config.checkpoint_path and not saved_any_ckpt:
+        try:
+            torch.save({
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "epoch": history[-1]["epoch"] if history else 0,
+                "val_loss": best_val,
+            }, config.checkpoint_path)
+        except Exception:
+            pass
+
     return history
